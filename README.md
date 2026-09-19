@@ -10,6 +10,10 @@ SQLite，支持事后查询。对已保存批次还可通过 `POST /api/batches/
 通过 `POST /api/batches/{id}/replacement-ranking` 在**内存**中模拟用候选序列
 替换某条引物，按 high 配对数、最大 3′连续互补、最大连续互补三个指标做
 非支配分层排名（不落库）；
+通过 `POST /api/batches/{id}/augmentation-plan` 在**内存**中对 2～18 条候选
+引物复用现有配对算法计算自二聚体、与原批次及候选两两异二聚体，在
+high/medium 冲突图上用**确定性分支限界**精确选出不超过接纳上限的最大无冲突
+候选集合（不落库）；
 通过 `POST /api/batches/{id}/threshold-map` 只读取已保存配对的两个标量指标
 （最长连续互补、3′端连续互补），用**二维差分**在请求的阈值网格上聚合出每个
 阈值组合下的 high/medium/low 配对数量（不重算对齐、不修改批次）；
@@ -34,6 +38,7 @@ docker compose up --build -d
 | 批次接口 | http://localhost:8000/api/batches |
 | 引物分池 | `POST http://localhost:8000/api/batches/{id}/pool-plan` |
 | 替换候选排名 | `POST http://localhost:8000/api/batches/{id}/replacement-ranking` |
+| 候选增量筛选 | `POST http://localhost:8000/api/batches/{id}/augmentation-plan` |
 | 阈值扫描地图 | `POST http://localhost:8000/api/batches/{id}/threshold-map` |
 | 批次风险对比 | `GET http://localhost:8000/api/batches/{base_id}/compare/{target_id}` |
 
@@ -303,6 +308,92 @@ curl -s -X POST http://localhost:8000/api/batches/f98cdd27-.../replacement-ranki
   最大 3′连续互补为 0 时，所有该指标为 0 的受影响配对都会列入
   `max_three_prime_pairs`。
 
+### `POST /api/batches/{id}/augmentation-plan` — 候选引物增量筛选（冲突图精确求解，不落库）
+
+向**已保存批次**追加候选引物时，提交 **2～18 条名称唯一的候选 IUPAC 序列**与
+最多接纳数 `max_selected`（1～18），服务在**内存**中计算候选的二聚体风险并
+精确给出可同时接纳的最大无冲突候选集合：
+
+* **复用现有配对算法、沿用批次原阈值**：对每个候选复用 `analyze_pair` 计算
+  ① 候选的**自二聚体**、② 候选与**每条原批次引物**的异二聚体、③ **候选两两**
+  异二聚体；风险等级按批次提交时的 `continuous_threshold`、
+  `three_prime_threshold` 判定，无需在请求中重复给出；
+* **冲突图**：候选为顶点。候选自二聚体或候选与原批次引物的配对达到
+  `high`/`medium` 时，该候选记**自环**（原批次引物固定在场，等价于候选被固定
+  禁止）；候选两两的 `high`/`medium` 配对记普通无向边（`low` 配对不产生边）；
+* **确定性分支限界精确解**：在冲突图上求**不超过 `max_selected`** 的最大独立集，
+  按候选下标升序“包含优先 / 排除其后”枚举（以贪心团覆盖做独立数上界剪枝），
+  故同规模时**按请求顺序字典序最小**的解为唯一返回，结果稳定可复现；
+* **淘汰原因**：
+  * `risk` —— 存在阻断配对，`blocking_pairs` 列出与**原批次引物**或**入选候选**
+    的全部阻断配对（含候选自二聚体），每个配对与 `GET /api/batches/{id}` 的
+    配对结果字段同构，并用 `counterpart_kind`（`self`/`batch`/`candidate`）与
+    `counterpart_name` 指明配对另一端；
+  * `capacity`（`limited_by_capacity: true`）—— 候选本身无任何阻断配对，仅因
+    不超过 `max_selected` 的数量上限未入选，`blocking_pairs` 为空；
+* **不落库**：纯内存计算，不修改批次、引物与已保存配对，也不新建批次；
+* 批次不存在返回 `404`；候选数量超出 2～18、`max_selected` 超出 1～18、
+  候选名称为空/重复（去首尾空白后比较）、**与批次内已有引物重名**、或序列含
+  非法 IUPAC 字符返回 `422`。
+
+```bash
+curl -s -X POST http://localhost:8000/api/batches/f98cdd27-.../augmentation-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "max_selected": 10,
+    "candidates": [
+      {"name": "newF", "sequence": "ACGTACGTAA"},
+      {"name": "newR", "sequence": "TTTTGGGGCC"}
+    ]
+  }'
+```
+
+返回示例：
+
+```json
+{
+  "batch_id": "f98cdd27-...",
+  "continuous_threshold": 4,
+  "three_prime_threshold": 3,
+  "max_selected": 10,
+  "candidate_count": 2,
+  "selected_count": 1,
+  "rejected_count": 1,
+  "selected": [
+    {"position": 0, "name": "newF", "sequence": "ACGTACGTAA"}
+  ],
+  "rejected": [
+    {
+      "position": 1,
+      "name": "newR",
+      "sequence": "TTTTGGGGCC",
+      "reason": "risk",
+      "limited_by_capacity": false,
+      "blocking_pairs": [
+        {
+          "pair_index": 3,
+          "name_top": "F", "name_bottom": "newR", "is_self_dimer": false,
+          "risk_level": "high",
+          "continuous_complementary_length": 4,
+          "three_prime_run_length": 4,
+          "counterpart_kind": "batch",
+          "counterpart_name": "F",
+          "alignment": { "...": "与批次配对结果同构" }
+        }
+      ]
+    }
+  ]
+}
+```
+
+* `selected` / `rejected` 均按请求顺序（`position` 即候选在请求中的序号，0 起）；
+* `blocking_pairs[].pair_index` 为本次内存枚举内的稳定序号：`[0, m)` 为候选
+  自二聚体，其后按候选、批次位置排列候选-原批次配对，最后按 `(i,j)` 行枚举
+  候选两两配对；
+* 被自身自二聚体淘汰时 `counterpart_kind: "self"`；与入选候选冲突时
+  `counterpart_kind: "candidate"`（只会列出最终入选的候选；与其他落选候选的
+  冲突不构成阻断）。
+
 ### `POST /api/batches/{id}/threshold-map` — 阈值扫描地图
 
 对**已保存批次**做一次“阈值敏感性扫描”：请求给出连续互补阈值与 3′端阈值的
@@ -532,12 +623,13 @@ app/
   iupac.py      # IUPAC 碱基集合与互补矩阵
   dimer.py      # 错位枚举、连续互补/3′端长度、风险判定、同分规则
   pooling.py    # 异二聚体冲突图构建与 DSatur 风格确定性贪心分池
+  augmentation.py # 候选增量冲突图上的确定性分支限界（容量受限最大独立集）
   ranking.py    # 替换候选的非支配分层（Pareto front，越小越优）
   threshold_map.py  # 阈值扫描地图的二维差分（imos）区间累加聚合
   compare.py    # 批次间稳定配对键构造与风险升降分类（escalated 等四类）
   schemas.py    # Pydantic 模型与输入校验
   db.py         # SQLite 建表、写入、查询
-  services.py   # 批次计算编排（N 自二聚体 + N(N-1)/2 异二聚体）、分池、替换排名、阈值地图与对比编排
+  services.py   # 批次计算编排（N 自二聚体 + N(N-1)/2 异二聚体）、分池、替换排名、候选增量筛选、阈值地图与对比编排
   main.py       # FastAPI 路由
   cli.py        # initdb 命令
 tests/          # pytest 算法与 API 测试

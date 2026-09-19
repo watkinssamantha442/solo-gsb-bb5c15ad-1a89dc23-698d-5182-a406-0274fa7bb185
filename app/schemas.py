@@ -319,6 +319,70 @@ class ReplacementRankingOut(BaseModel):
     )
 
 
+class AugmentationCandidateIn(PrimerIn):
+    """增量候选：复用 PrimerIn 的名称与 IUPAC 序列校验。"""
+
+
+class AugmentationPlanRequest(BaseModel):
+    max_selected: int = Field(
+        ..., ge=1, le=18, description="最多接纳（入选）的候选数（1～18）"
+    )
+    candidates: list[AugmentationCandidateIn] = Field(
+        ..., min_length=2, max_length=18, description="2～18 条名称唯一的候选引物"
+    )
+
+
+class AugmentationBlockingPairOut(PairOut):
+    """阻断候选入选的一条 high/medium 配对。"""
+
+    counterpart_kind: str = Field(
+        description="配对另一端的类别：self=候选自二聚体，batch=原批次引物，candidate=入选候选"
+    )
+    counterpart_name: str = Field(
+        description="配对另一端名称（自二聚体时与候选同名）"
+    )
+
+
+class AugmentationSelectedOut(BaseModel):
+    position: int = Field(description="候选在请求中的序号（0 起）")
+    name: str
+    sequence: str
+
+
+class AugmentationRejectedOut(BaseModel):
+    position: int = Field(description="候选在请求中的序号（0 起）")
+    name: str
+    sequence: str
+    reason: str = Field(
+        description="淘汰原因：risk=high/medium 配对阻断；capacity=无风险冲突但接纳数已满"
+    )
+    limited_by_capacity: bool = Field(
+        description="true 表示候选本身无阻断配对，仅因不超过 max_selected 的数量上限未入选"
+    )
+    blocking_pairs: list[AugmentationBlockingPairOut] = Field(
+        description=(
+            "risk 淘汰时的全部阻断配对（候选自二聚体、与原批次引物、与入选候选），"
+            "按全局配对顺序排列；capacity 淘汰时为空列表"
+        )
+    )
+
+
+class AugmentationPlanOut(BaseModel):
+    batch_id: str
+    continuous_threshold: int = Field(description="沿用的批次原连续互补阈值")
+    three_prime_threshold: int = Field(description="沿用的批次原 3′端连续互补阈值")
+    max_selected: int = Field(description="请求给定的最多接纳数")
+    candidate_count: int
+    selected_count: int
+    rejected_count: int
+    selected: list[AugmentationSelectedOut] = Field(
+        description="入选候选（按请求顺序）"
+    )
+    rejected: list[AugmentationRejectedOut] = Field(
+        description="未入选候选（按请求顺序）"
+    )
+
+
 class ThresholdMapRequest(BaseModel):
     continuous_start: int = Field(
         ...,

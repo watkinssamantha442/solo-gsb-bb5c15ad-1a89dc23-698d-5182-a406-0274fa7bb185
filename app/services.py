@@ -6,6 +6,7 @@ import json
 import uuid
 
 from . import db
+from .augmentation import maximum_independent_set
 from .compare import PairDiff, compare_pair_risks
 from .dimer import PairResult, analyze_pair
 from .pooling import build_pool_plan
@@ -349,6 +350,183 @@ def rank_replacements(
         "primer_count": n,
         "candidate_count": len(candidates),
         "candidates": ranked,
+    }
+
+
+def _cand_pair_order(i: int, j: int, m: int) -> int:
+    """候选两两异二聚体 (i,j)（i<j）在按行枚举序列中的序号。"""
+    return i * (2 * m - i - 1) // 2 + (j - i - 1)
+
+
+def plan_batch_augmentation(
+    *,
+    batch_id: str,
+    max_selected: int,
+    candidates: list[tuple[str, str]],
+) -> dict | None:
+    """对已保存批次做候选引物增量筛选的内存模拟（不落库）。
+
+    纯读操作：读取批次阈值与引物序列后，仅在内存中复用 analyze_pair 计算
+    每个候选的自二聚体、候选与每条原批次引物的异二聚体、候选两两异二聚体，
+    沿用批次原阈值判定风险。high/medium 配对构成冲突图（候选自二聚体与
+    候选-原批次阻断记为自环），用确定性分支限界在不超过 max_selected 的
+    约束下精确求最大无冲突候选集合；同规模时按请求顺序取字典序最小解。
+
+    批次不存在返回 None（路由层转 404）；候选名与批次引物重名或候选间重名
+    抛出 ValueError（路由层转 422）。candidates 为 (name, normalized_sequence)
+    列表，数量与序列合法性由请求模型保证。
+    """
+    with db.get_conn() as conn:
+        batch = db.get_batch(conn, batch_id)
+        if batch is None:
+            return None
+        primers = db.get_primers(conn, batch_id)
+
+    continuous_threshold = batch["continuous_threshold"]
+    three_prime_threshold = batch["three_prime_threshold"]
+    m = len(candidates)
+
+    batch_names = {row["name"] for row in primers}
+    clashes = [name for name, _ in candidates if name in batch_names]
+    if clashes:
+        raise ValueError(
+            "候选名称与批次内已有引物重名: " + ", ".join(clashes)
+        )
+
+    # 候选自二聚体（self_pairs）与候选-原批次异二聚体（batch_pairs[i] 按
+    # 批次位置排列）；候选两两异二聚体见 cand_pairs[(i,j)]，i<j
+    self_pairs: list[PairResult] = []
+    batch_pairs: list[list[PairResult]] = []
+    for cname, cseq in candidates:
+        self_pairs.append(
+            analyze_pair(
+                cname, cseq, cname, cseq,
+                continuous_threshold, three_prime_threshold,
+                is_self_dimer=True,
+            )
+        )
+        against_batch: list[PairResult] = []
+        for row in primers:
+            # 统一以原批次引物为 top、候选为 bottom，与“原批次在前、候选追加
+            # 在后”的概念顺序一致（analyze_pair 的风险结论与 top/bottom 次序无关）
+            result = analyze_pair(
+                row["name"], row["sequence"], cname, cseq,
+                continuous_threshold, three_prime_threshold,
+                is_self_dimer=False,
+            )
+            against_batch.append(result)
+        batch_pairs.append(against_batch)
+
+    cand_pairs: dict[tuple[int, int], PairResult] = {}
+    for i in range(m):
+        for j in range(i + 1, m):
+            name_i, seq_i = candidates[i]
+            name_j, seq_j = candidates[j]
+            cand_pairs[(i, j)] = analyze_pair(
+                name_i, seq_i, name_j, seq_j,
+                continuous_threshold, three_prime_threshold,
+                is_self_dimer=False,
+            )
+
+    # 冲突图：候选顶点 0..m-1；自环表示被自身自二聚体或原批次阻断
+    adjacency: list[set[int]] = [set() for _ in range(m)]
+    for i in range(m):
+        if self_pairs[i].risk_level in ("high", "medium"):
+            adjacency[i].add(i)
+        for bp, result in enumerate(batch_pairs[i]):
+            if result.risk_level in ("high", "medium"):
+                adjacency[i].add(i)
+                break
+    for (i, j), result in cand_pairs.items():
+        if result.risk_level in ("high", "medium"):
+            adjacency[i].add(j)
+            adjacency[j].add(i)
+
+    solution = maximum_independent_set(adjacency, max_selected)
+    selected_set = set(solution.selected)
+
+    def _blocking_out(
+        pair_index: int,
+        result: PairResult,
+        counterpart_kind: str,
+        counterpart_name: str,
+    ) -> dict:
+        out = _pair_result_to_out(pair_index, result)
+        out["counterpart_kind"] = counterpart_kind
+        out["counterpart_name"] = counterpart_name
+        return out
+
+    rejected_out: list[dict] = []
+    for i, (cname, cseq) in enumerate(candidates):
+        if i in selected_set:
+            continue
+
+        # 阻断配对仅列：候选自二聚体、与原批次引物、与入选候选。
+        # pair_index 为本次内存枚举内的稳定序号，仅用于明细排序：
+        # [0, m) 候选自二聚体；[m, m+m*N) 候选-原批次（按候选、批次位置）；
+        # 其后为候选两两异二聚体（按 (i,j) i<j 行枚举）。
+        blocking: list[dict] = []
+
+        self_result = self_pairs[i]
+        if self_result.risk_level in ("high", "medium"):
+            blocking.append(
+                _blocking_out(i, self_result, "self", cname)
+            )
+
+        batch_blocked = False
+        for bp, row in enumerate(primers):
+            result = batch_pairs[i][bp]
+            if result.risk_level in ("high", "medium"):
+                pair_index = m + i * len(primers) + bp
+                blocking.append(
+                    _blocking_out(
+                        pair_index, result, "batch", row["name"]
+                    )
+                )
+                batch_blocked = True
+
+        selected_blocked = False
+        for j in sorted(selected_set):
+            a, b = (i, j) if i < j else (j, i)
+            result = cand_pairs[(a, b)]
+            if result.risk_level in ("high", "medium"):
+                pair_index = m + m * len(primers) + _cand_pair_order(a, b, m)
+                blocking.append(
+                    _blocking_out(
+                        pair_index, result, "candidate", candidates[j][0]
+                    )
+                )
+                selected_blocked = True
+
+        limited_by_capacity = not (
+            i in solution.self_blocked or batch_blocked or selected_blocked
+        )
+        rejected_out.append(
+            {
+                "position": i,
+                "name": cname,
+                "sequence": cseq,
+                "reason": "capacity" if limited_by_capacity else "risk",
+                "limited_by_capacity": limited_by_capacity,
+                "blocking_pairs": blocking,
+            }
+        )
+
+    selected_out = [
+        {"position": i, "name": candidates[i][0], "sequence": candidates[i][1]}
+        for i in sorted(selected_set)
+    ]
+
+    return {
+        "batch_id": batch_id,
+        "continuous_threshold": continuous_threshold,
+        "three_prime_threshold": three_prime_threshold,
+        "max_selected": max_selected,
+        "candidate_count": m,
+        "selected_count": len(selected_out),
+        "rejected_count": len(rejected_out),
+        "selected": selected_out,
+        "rejected": rejected_out,
     }
 
 

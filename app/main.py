@@ -9,6 +9,8 @@ from fastapi.responses import RedirectResponse
 
 from . import config, db
 from .schemas import (
+    AugmentationPlanOut,
+    AugmentationPlanRequest,
     BatchCompareResult,
     BatchCreate,
     BatchList,
@@ -26,6 +28,7 @@ from .schemas import (
 from .services import (
     build_batch_threshold_map,
     compare_batches,
+    plan_batch_augmentation,
     plan_batch_pools,
     rank_replacements,
     run_batch,
@@ -219,6 +222,46 @@ def create_replacement_ranking(
     if result is None:
         raise HTTPException(status_code=404, detail="批次不存在")
     return ReplacementRankingOut(**result)
+
+
+@app.post(
+    "/api/batches/{batch_id}/augmentation-plan",
+    tags=["batches"],
+    summary="候选引物增量筛选：冲突图上的确定性分支限界精确解（不落库）",
+    response_model=AugmentationPlanOut,
+    responses={
+        404: {"description": "批次不存在"},
+        422: {"description": "候选名称非法/重复或数量超限"},
+    },
+)
+def create_augmentation_plan(
+    batch_id: str, payload: AugmentationPlanRequest
+) -> AugmentationPlanOut:
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    candidates: list[tuple[str, str]] = []
+    for c in payload.candidates:
+        if c.name in seen:
+            duplicates.append(c.name)
+        seen.add(c.name)
+        candidates.append((c.name, c.sequence))
+    if duplicates:
+        raise HTTPException(
+            status_code=422,
+            detail=f"候选引物名称重复: {', '.join(duplicates)}",
+        )
+
+    try:
+        result = plan_batch_augmentation(
+            batch_id=batch_id,
+            max_selected=payload.max_selected,
+            candidates=candidates,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="批次不存在")
+    return AugmentationPlanOut(**result)
 
 
 @app.post(
