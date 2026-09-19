@@ -10,6 +10,10 @@ SQLite，支持事后查询。对已保存批次还可通过 `POST /api/batches/
 通过 `POST /api/batches/{id}/replacement-ranking` 在**内存**中模拟用候选序列
 替换某条引物，按 high 配对数、最大 3′连续互补、最大连续互补三个指标做
 非支配分层排名（不落库）；
+通过 `POST /api/batches/{id}/augmentation-plan` 在**内存**中评估 2～18 条
+候选增补引物，复用同一对齐算法计算候选自二聚体、候选与原批次及候选间配对，
+在 high/medium 冲突图上用**确定性分支限界**精确选出不超过接纳上限的
+最大无冲突候选集合（不落库）；
 通过 `POST /api/batches/{id}/threshold-map` 只读取已保存配对的两个标量指标
 （最长连续互补、3′端连续互补），用**二维差分**在请求的阈值网格上聚合出每个
 阈值组合下的 high/medium/low 配对数量（不重算对齐、不修改批次）；
@@ -34,6 +38,7 @@ docker compose up --build -d
 | 批次接口 | http://localhost:8000/api/batches |
 | 引物分池 | `POST http://localhost:8000/api/batches/{id}/pool-plan` |
 | 替换候选排名 | `POST http://localhost:8000/api/batches/{id}/replacement-ranking` |
+| 增补方案 | `POST http://localhost:8000/api/batches/{id}/augmentation-plan` |
 | 阈值扫描地图 | `POST http://localhost:8000/api/batches/{id}/threshold-map` |
 | 批次风险对比 | `GET http://localhost:8000/api/batches/{base_id}/compare/{target_id}` |
 
@@ -303,6 +308,101 @@ curl -s -X POST http://localhost:8000/api/batches/f98cdd27-.../replacement-ranki
   最大 3′连续互补为 0 时，所有该指标为 0 的受影响配对都会列入
   `max_three_prime_pairs`。
 
+### `POST /api/batches/{id}/augmentation-plan` — 候选增补引物的最大无冲突精确选优
+
+向**已保存批次**提交 **2～18 条名称唯一的候选 IUPAC 引物**与最多接纳数
+`max_accepted`（1～18），服务在**内存**中求解“最多增补多少条、具体哪几条”，
+不写库：
+
+* **沿用批次原阈值**：风险等级按批次提交时的 `continuous_threshold`、
+  `three_prime_threshold` 判定，请求中无需也不能给出阈值；
+* **复用现有 `analyze_pair`**：计算每个候选的 ① **自二聚体**、② 与
+  **原批次每条引物**的异二聚体、③ **候选两两**异二聚体，枚举与风险判定规则
+  与批次筛查完全一致；
+* **冲突图与精确求解**：全部 `high`/`medium` 配对构成冲突关系——
+  自二聚体或与原批次引物冲突的候选被**预先淘汰**；候选间冲突构成无向冲突图，
+  被同一条边连接的两个候选不可同时入选。用**确定性分支限界**（含/不含
+  最小下标顶点递归 + 上界剪枝）精确求**不超过 `max_accepted` 的最大独立集**，
+  不存在任何启发式近似；同规模多解时按请求顺序（下标序列）**字典序取唯一解**，
+  相同输入结果稳定可复现；
+* **`selected` / `rejected`**：入选按请求顺序返回；落选候选区分
+  `reject_reason`：
+  * `risk` —— 存在阻断配对，`blocked_pairs` 列出其**自二聚体**、与
+    **原批次引物**或与**入选候选**的全部 high/medium 阻断配对（与其它落选候选
+    的配对不列入），配对字段与 `GET /api/batches/{id}` **完全同构**
+    （含风险等级、连续/3′连续互补长度、风险原因与对齐可视化），另附
+    `counterpart_kind`（self/batch/candidate）、`counterpart_name` 与
+    `counterpart_position`；
+  * `capacity` —— 本身无阻断、可安全增补，但因接纳上限未入选（显式标记，
+    `blocked_pairs` 为空）；
+* **不落库**：纯内存计算，不修改批次、引物与已保存配对；
+* 批次不存在返回 `404`；候选数量超出 2～18、接纳数超出 1～18、名称请求内
+  重复、与批次内引物**重名**或序列含非法 IUPAC 字符返回 `422`。
+
+```bash
+curl -s -X POST http://localhost:8000/api/batches/f98cdd27-.../augmentation-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "max_accepted": 3,
+    "candidates": [
+      {"name": "aug-1", "sequence": "ACGTACGT"},
+      {"name": "aug-2", "sequence": "GGGTTTCCC"},
+      {"name": "hairpin", "sequence": "CCCCCGGGGG"}
+    ]
+  }'
+```
+
+请求字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `candidates` | 2～18 条候选；字段与批次提交的 `primers[]` 相同（`name` 非空、请求内唯一且不得与批次引物重名；`sequence` 为 5′→3′ IUPAC DNA 序列） |
+| `max_accepted` | 最多接纳（入选）数量，1～18；无冲突候选不足时返回全部可入选者 |
+
+返回示例：
+
+```json
+{
+  "batch_id": "f98cdd27-...",
+  "continuous_threshold": 4,
+  "three_prime_threshold": 3,
+  "candidate_count": 3,
+  "max_accepted": 3,
+  "selected_count": 2,
+  "rejected_count": 1,
+  "selected": [
+    {"name": "aug-1", "sequence": "ACGTACGT", "position": 0},
+    {"name": "aug-2", "sequence": "GGGTTTCCC", "position": 1}
+  ],
+  "rejected": [
+    {
+      "name": "hairpin", "sequence": "CCCCCGGGGG", "position": 2,
+      "reject_reason": "risk",
+      "blocked_pairs": [
+        {
+          "name_top": "hairpin", "name_bottom": "hairpin",
+          "is_self_dimer": true, "risk_level": "high",
+          "continuous_complementary_length": 10,
+          "three_prime_run_length": 10,
+          "counterpart_kind": "self",
+          "counterpart_name": "hairpin",
+          "counterpart_position": null,
+          "risk_reasons": ["..."],
+          "alignment": {"top": "...", "match": "...", "bottom": "..."}
+        }
+      ]
+    }
+  ]
+}
+```
+
+* `selected[].position` 与 `rejected[].position` 为候选在请求中的序号（0 起）；
+  `selected`、`rejected` 各自按请求顺序排列；
+* 因上限落选（`capacity`）的候选不附带任何阻断配对；因风险落选（`risk`）者
+  至少有一条阻断配对；与原批次引物的阻断配对中 `counterpart_position` 为该
+  引物在原批次中的位置，与入选候选的阻断配对中为候选请求序号；
+* 无风险可入选候选数 ≤ `max_accepted` 时 `rejected` 为空或全部为 `risk`。
+
 ### `POST /api/batches/{id}/threshold-map` — 阈值扫描地图
 
 对**已保存批次**做一次“阈值敏感性扫描”：请求给出连续互补阈值与 3′端阈值的
@@ -532,6 +632,7 @@ app/
   iupac.py      # IUPAC 碱基集合与互补矩阵
   dimer.py      # 错位枚举、连续互补/3′端长度、风险判定、同分规则
   pooling.py    # 异二聚体冲突图构建与 DSatur 风格确定性贪心分池
+  augmentation.py  # 增补候选冲突图的确定性分支限界最大独立集（精确求解）
   ranking.py    # 替换候选的非支配分层（Pareto front，越小越优）
   threshold_map.py  # 阈值扫描地图的二维差分（imos）区间累加聚合
   compare.py    # 批次间稳定配对键构造与风险升降分类（escalated 等四类）

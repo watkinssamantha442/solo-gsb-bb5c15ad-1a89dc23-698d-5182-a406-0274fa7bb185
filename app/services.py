@@ -6,6 +6,7 @@ import json
 import uuid
 
 from . import db
+from .augmentation import maximum_conflict_free_set
 from .compare import PairDiff, compare_pair_risks
 from .dimer import PairResult, analyze_pair
 from .pooling import build_pool_plan
@@ -349,6 +350,177 @@ def rank_replacements(
         "primer_count": n,
         "candidate_count": len(candidates),
         "candidates": ranked,
+    }
+
+
+def plan_batch_augmentation(
+    *,
+    batch_id: str,
+    candidates: list[tuple[str, str]],
+    max_accepted: int,
+) -> dict | None:
+    """为已保存批次做增补引物方案的纯内存求解（不落库）。
+
+    沿用批次原阈值，复用 analyze_pair 计算每个候选的：
+    ① 候选自二聚体；② 候选与原批次每条引物的异二聚体；
+    ③ 候选两两异二聚体。全部 high/medium 配对构成冲突关系：
+    自二聚体或与原批次冲突的候选被预先淘汰；候选间冲突构成冲突图，
+    用确定性分支限界精确选出不超过 max_accepted 的最大无冲突集合，
+    同规模按下标序列字典序取唯一解。
+
+    批次不存在返回 None（路由层转 404）；候选与原批次引物重名抛出
+    ValueError（路由层转 422）。候选数量与名称请求内唯一性由路由层保证。
+    """
+    with db.get_conn() as conn:
+        batch = db.get_batch(conn, batch_id)
+        if batch is None:
+            return None
+        primers = db.get_primers(conn, batch_id)
+
+    ct = batch["continuous_threshold"]
+    tt = batch["three_prime_threshold"]
+    n = len(primers)
+    m = len(candidates)
+
+    existing_names = {row["name"] for row in primers}
+    clashes = [name for name, _ in candidates if name in existing_names]
+    if clashes:
+        raise ValueError(
+            "候选名称与批次内已有引物重名: " + ", ".join(clashes)
+        )
+
+    # 虚拟“原批次 + 候选”布局：原引物占位置 0..n-1，候选占 n..n+m-1。
+    # pair_index 与 run_batch 同构（先全部自二聚体，再按 (i,j) i<j 枚举），
+    # 仅用于回传标识，不写库。
+    total = n + m
+
+    def hetero_index(i: int, j: int) -> int:
+        return total + i * (2 * total - i - 1) // 2 + (j - i - 1)
+
+    # 每个候选的阻断信息：(pair_index, PairResult, 对方类别, 对方名称, 对方位置|None)
+    # kind: self / batch / candidate
+    blocking: list[list[tuple[int, PairResult, str, str, int | None]]] = [
+        [] for _ in range(m)
+    ]
+
+    def add_pair(
+        ci: int,
+        kind: str,
+        counterpart_name: str,
+        counterpart_pos: int | None,
+        index: int,
+        result: PairResult,
+    ) -> None:
+        if result.risk_level in ("high", "medium"):
+            blocking[ci].append(
+                (index, result, kind, counterpart_name, counterpart_pos)
+            )
+
+    # ① 候选自二聚体
+    for ci, (name, seq) in enumerate(candidates):
+        result = analyze_pair(
+            name, seq, name, seq, ct, tt, is_self_dimer=True
+        )
+        add_pair(ci, "self", name, None, n + ci, result)
+
+    # ② 候选与原批次引物的异二聚体（top 固定为虚拟位置靠前者）
+    for row in primers:
+        bp = row["position"]
+        for ci, (name, seq) in enumerate(candidates):
+            cp = n + ci
+            if cp < bp:
+                result = analyze_pair(
+                    name, seq, row["name"], row["sequence"], ct, tt,
+                    is_self_dimer=False,
+                )
+            else:
+                result = analyze_pair(
+                    row["name"], row["sequence"], name, seq, ct, tt,
+                    is_self_dimer=False,
+                )
+            add_pair(
+                ci, "batch", row["name"], bp,
+                hetero_index(min(cp, bp), max(cp, bp)), result,
+            )
+
+    # ③ 候选两两异二聚体（请求顺序靠前者为 top）
+    candidate_edges: list[tuple[int, int]] = []
+    for i in range(m):
+        name_i, seq_i = candidates[i]
+        for j in range(i + 1, m):
+            name_j, seq_j = candidates[j]
+            result = analyze_pair(
+                name_i, seq_i, name_j, seq_j, ct, tt, is_self_dimer=False
+            )
+            index = hetero_index(n + i, n + j)
+            add_pair(i, "candidate", name_j, j, index, result)
+            add_pair(j, "candidate", name_i, i, index, result)
+            if result.risk_level in ("high", "medium"):
+                candidate_edges.append((i, j))
+
+    # 自二聚体或与原批次引物 high/medium 冲突的候选预先淘汰；
+    # 候选间冲突仅作为冲突图边，不预先淘汰任何一方
+    preblocked = {
+        ci
+        for ci in range(m)
+        if any(item[2] in ("self", "batch") for item in blocking[ci])
+    }
+    selected_indices = maximum_conflict_free_set(
+        candidate_count=m,
+        blocked=preblocked,
+        edges=candidate_edges,
+        limit=max_accepted,
+    )
+    selected_set = set(selected_indices)
+
+    def blocked_pair_out(
+        item: tuple[int, PairResult, str, str, int | None]
+    ) -> dict:
+        index, result, kind, counterpart_name, counterpart_pos = item
+        out = _pair_result_to_out(index, result)
+        out["counterpart_kind"] = kind
+        out["counterpart_name"] = counterpart_name
+        out["counterpart_position"] = counterpart_pos
+        return out
+
+    selected_out = [
+        {"name": candidates[ci][0], "sequence": candidates[ci][1], "position": ci}
+        for ci in selected_indices
+    ]
+
+    rejected_out: list[dict] = []
+    for ci in range(m):
+        if ci in selected_set:
+            continue
+        # 阻断配对仅列：候选自二聚体、与原批次引物、与入选候选
+        # （与其它落选候选的 high/medium 配对不构成阻断理由）
+        pairs = [
+            item
+            for item in blocking[ci]
+            if item[2] != "candidate" or item[4] in selected_set
+        ]
+        pairs.sort(key=lambda item: item[0])
+        reason = "risk" if pairs else "capacity"
+        rejected_out.append(
+            {
+                "name": candidates[ci][0],
+                "sequence": candidates[ci][1],
+                "position": ci,
+                "reject_reason": reason,
+                "blocked_pairs": [blocked_pair_out(item) for item in pairs],
+            }
+        )
+
+    return {
+        "batch_id": batch_id,
+        "continuous_threshold": ct,
+        "three_prime_threshold": tt,
+        "candidate_count": m,
+        "max_accepted": max_accepted,
+        "selected_count": len(selected_out),
+        "rejected_count": len(rejected_out),
+        "selected": selected_out,
+        "rejected": rejected_out,
     }
 
 
